@@ -160,13 +160,19 @@ def measurement_compatibility(
     单位与目标单位不符的读数逐条返回原因、不参与计算。
 
     对可参与读数两两计算 En=|x_i-x_j|/sqrt(U_i²+U_j²)，En≤1 判为相容；
+    En 按稳定缩放计算（避免大数平方溢出与次正规平方下溢误判）；
     两个不确定度均为 0 时 En 无定义（响应中为 null），仅读数相等才相容。
+    读数差绝对值或 En 超出有限浮点可表示范围时返回 422（中文原因），
+    不让无穷值进入响应。
     返回每对 En 与判定，以及全部人数 ≥2 的**极大两两相容分组**（极大团，
     分组可重叠，按仪器编码稳定排序，不以连通分量代替）。
     """
-    return build_measurement_compatibility_report(
-        db,
-        body.at,
-        body.target_unit,
-        [(r.instrument_code, r.value) for r in body.readings],
-    )
+    try:
+        return build_measurement_compatibility_report(
+            db,
+            body.at,
+            body.target_unit,
+            [(r.instrument_code, r.value) for r in body.readings],
+        )
+    except crud.ValidationError as exc:
+        raise HTTPException(422, str(exc))

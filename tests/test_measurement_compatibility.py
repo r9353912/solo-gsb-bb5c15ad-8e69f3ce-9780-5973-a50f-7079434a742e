@@ -228,6 +228,100 @@ def test_one_zero_uncertainty_uses_normal_formula(client: TestClient):
     assert p["rule"] == "en_le_1"
 
 
+def test_en_large_uncertainties_scaled_no_overflow(client: TestClient):
+    """U=1e200 时平方和溢出为 inf：朴素实现把 En 算成 0、把差异巨大的
+    一对误判为相容；稳定缩放后 En≈2.12>1 判为不相容，不进入任何分组。"""
+    _submit(
+        client,
+        [_inst("G", root=True), _inst("A"), _inst("B")],
+        [
+            _cert("CG", "G", issued="2024-01-01T00:00:00",
+                  vf="2024-01-01T00:00:00", vu="2030-01-01T00:00:00",
+                  u=1e199, unit="mm"),
+            _cert("CA", "A", u=1e200, unit="mm"),
+            _cert("CB", "B", u=1e200, unit="mm"),
+        ],
+        [
+            {"child_cert_id": "CA", "parent_cert_id": "CG"},
+            {"child_cert_id": "CB", "parent_cert_id": "CG"},
+        ],
+    )
+    d = _post(client, [_reading("A", 0.0), _reading("B", 3e200)]).json()
+    assert d["participant_count"] == 2
+    p = d["pairs"][0]
+    assert p["difference"] == 3e200
+    # En = 3e200 / (sqrt(2) * 1e200) ≈ 2.121 > 1 -> 不相容
+    assert p["en"] == pytest.approx(3.0 / math.sqrt(2.0))
+    assert p["compatible"] is False
+    assert p["rule"] == "en_le_1"
+    assert d["groups"] == []
+    assert d["statistics"]["compatible_pair_count"] == 0
+
+
+def test_en_subnormal_uncertainties_not_misjudged_as_zero(client: TestClient):
+    """U 为次正规非零值（1e-320）时平方下溢为 0：朴素实现误走双零规则
+    （读数不等即不相容）；稳定缩放后按常式 En 判定并正常成组。"""
+    tiny = 1e-320  # 次正规非零值；tiny*tiny 下溢为 0
+    assert tiny > 0.0 and tiny * tiny == 0.0
+    _submit(
+        client,
+        [_inst("G", root=True), _inst("A"), _inst("B")],
+        [
+            _cert("CG", "G", issued="2024-01-01T00:00:00",
+                  vf="2024-01-01T00:00:00", vu="2030-01-01T00:00:00",
+                  u=0.0, unit="mm"),
+            _cert("CA", "A", u=tiny, unit="mm"),
+            _cert("CB", "B", u=tiny, unit="mm"),
+        ],
+        [
+            {"child_cert_id": "CA", "parent_cert_id": "CG"},
+            {"child_cert_id": "CB", "parent_cert_id": "CG"},
+        ],
+    )
+    # 差值同为 1e-320：En = 1/sqrt(2) ≈ 0.707 ≤ 1 -> 相容（走常式而非双零规则）
+    d = _post(client, [_reading("A", 0.0), _reading("B", tiny)]).json()
+    p = d["pairs"][0]
+    assert p["rule"] == "en_le_1"
+    assert p["en"] == pytest.approx(1.0 / math.sqrt(2.0))
+    assert p["compatible"] is True
+    assert d["groups"] == [{"members": ["A", "B"], "size": 2}]
+
+
+def test_reading_difference_overflow_returns_422(client: TestClient):
+    """读数差绝对值超出有限浮点范围（1e308 与 -1e308 之差为 inf）：返回
+    422 并说明原因，不让无穷值进入响应。"""
+    _mm_lab(client, codes=("W1", "W2"))
+    r = _post(client, [_reading("W1", 1e308), _reading("W2", -1e308)])
+    assert r.status_code == 422
+    assert "读数差" in r.json()["detail"]
+    assert "有限浮点" in r.json()["detail"]
+
+
+def test_en_overflow_returns_422(client: TestClient):
+    """读数差有限但 En 超出有限浮点范围（差 1e308、U=1e-320 -> En≈1e628）：
+    返回 422 并说明原因。"""
+    tiny = 1e-320
+    _submit(
+        client,
+        [_inst("G", root=True), _inst("A"), _inst("B")],
+        [
+            _cert("CG", "G", issued="2024-01-01T00:00:00",
+                  vf="2024-01-01T00:00:00", vu="2030-01-01T00:00:00",
+                  u=0.0, unit="mm"),
+            _cert("CA", "A", u=tiny, unit="mm"),
+            _cert("CB", "B", u=tiny, unit="mm"),
+        ],
+        [
+            {"child_cert_id": "CA", "parent_cert_id": "CG"},
+            {"child_cert_id": "CB", "parent_cert_id": "CG"},
+        ],
+    )
+    r = _post(client, [_reading("A", 0.0), _reading("B", 1e308)])
+    assert r.status_code == 422
+    assert "En" in r.json()["detail"]
+    assert "有限浮点" in r.json()["detail"]
+
+
 def test_unit_mismatch_reading_excluded_with_reason(client: TestClient):
     """起点证书单位与目标单位不符：逐条返回原因，不参与计算。"""
     _mm_lab(client, codes=("W1", "W2"))

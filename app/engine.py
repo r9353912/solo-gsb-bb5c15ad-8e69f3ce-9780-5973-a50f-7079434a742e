@@ -1206,19 +1206,44 @@ EN_RULE_ZERO_UNCERTAINTY = "zero_uncertainty_equality"
 
 def _en_score(
     xi: float, xj: float, ui: float, uj: float
-) -> tuple[Optional[float], bool, str]:
+) -> tuple[float, Optional[float], bool, str]:
     """计算一对读数的 En 数与相容判定。
 
+    返回 ``(读数差绝对值, En, 是否相容, 判定规则)``；pairs 与极大相容
+    分组共用这一判定结果。
+
     En = |x_i - x_j| / sqrt(U_i^2 + U_j^2)，En <= 1 判为相容；
-    两个不确定度均为 0 时分母为 0、En 无定义（返回 None），
+    两个不确定度确实均为 0 时 En 无定义（返回 None），
     此时仅当两读数相等才相容。
+
+    非零不确定度按**稳定缩放**计算：取 m = max(U_i, U_j) > 0，
+
+        En = (|Δx| / m) / sqrt((U_i/m)^2 + (U_j/m)^2)
+
+    被平方的项落在 [0, 1]，既避免大数不确定度平方溢出为 inf
+    （会把差异巨大的一对误判为相容），也避免次正规非零不确定度平方
+    下溢为 0（会误走双零规则）；且不先还原分母（m * sqrt(2) 自身
+    可能溢出为 inf，会把 En 错误归零），直接得到 En。
+
+    读数差绝对值或 En 超出有限浮点可表示范围时抛出
+    :class:`ValidationError`（接口层转为 422），不让无穷值进入响应。
     """
     difference = abs(xi - xj)
-    denominator = math.sqrt(ui * ui + uj * uj)
-    if denominator == 0:
-        return None, difference == 0, EN_RULE_ZERO_UNCERTAINTY
-    en = difference / denominator
-    return en, en <= 1.0, EN_RULE_RATIO
+    if not math.isfinite(difference):
+        raise ValidationError(
+            f"读数差绝对值 |{xi} - ({xj})| 超出有限浮点可表示范围，"
+            "无法计算 En 数"
+        )
+    if ui == 0.0 and uj == 0.0:
+        return difference, None, difference == 0.0, EN_RULE_ZERO_UNCERTAINTY
+    m = max(ui, uj)
+    en = (difference / m) / math.sqrt((ui / m) ** 2 + (uj / m) ** 2)
+    if not math.isfinite(en):
+        raise ValidationError(
+            f"En 数超出有限浮点可表示范围（读数差 {difference}，"
+            f"不确定度 {ui} 与 {uj}），无法判定相容性"
+        )
+    return difference, en, en <= 1.0, EN_RULE_RATIO
 
 
 def maximal_compatible_groups(
@@ -1268,8 +1293,11 @@ def build_measurement_compatibility_report(
     （resolution=unique 且零 ERROR）的溯源链参与，取其**起点证书**的
     扩展不确定度作为该读数的 U；链不可用（多候选绝不任取一条）或
     起点证书单位与目标单位不符的读数逐条给出原因、不参与计算。
-    对可参与读数两两计算 En 并判定相容性，再以极大团（而非连通分量）
-    给出全部人数 ≥ 2 的极大两两相容分组（可重叠，按仪器编码稳定排序）。
+    对可参与读数两两计算 En 并判定相容性（稳定缩放，见 ``_en_score``；
+    读数差绝对值或 En 超出有限浮点可表示范围时抛出 ValidationError，
+    由接口层转为 422），pairs 与分组共用同一判定；再以极大团（而非
+    连通分量）给出全部人数 ≥ 2 的极大两两相容分组（可重叠，按仪器
+    编码稳定排序）。
     """
     at_naive = to_utc_naive(at) if at else datetime.utcnow()
     at_s = fmt(at_naive)
@@ -1376,12 +1404,14 @@ def build_measurement_compatibility_report(
             nonparticipants.append(np_detail)
         reading_results.append(result)
 
-    # 两两 En 计算（按仪器编码排序，保证输出稳定）
+    # 两两 En 计算（按仪器编码排序，保证输出稳定）；
+    # 读数差绝对值或 En 超出有限浮点范围时 _en_score 抛出 ValidationError，
+    # 由接口层转为 422，不让无穷值进入响应。
     pairs: list[dict[str, Any]] = []
     compatible_pairs: list[tuple[str, str]] = []
     for a, b in combinations(sorted(participants), 2):
         da, db = accepted[a], accepted[b]
-        en, compatible, rule = _en_score(
+        difference, en, compatible, rule = _en_score(
             da["value"], db["value"], da["uncertainty"], db["uncertainty"]
         )
         pairs.append(
@@ -1392,7 +1422,7 @@ def build_measurement_compatibility_report(
                 "value_b": db["value"],
                 "uncertainty_a": da["uncertainty"],
                 "uncertainty_b": db["uncertainty"],
-                "difference": abs(da["value"] - db["value"]),
+                "difference": difference,
                 "en": en,
                 "compatible": compatible,
                 "rule": rule,
