@@ -1203,22 +1203,95 @@ REASON_CERTIFICATE_UNIT_MISMATCH = "CERTIFICATE_UNIT_MISMATCH"
 EN_RULE_RATIO = "en_le_1"
 EN_RULE_ZERO_UNCERTAINTY = "zero_uncertainty_equality"
 
+# En 计算无法以有限浮点给出结果的原因码（路由层统一映射为 422，
+# 避免 inf/NaN 进入响应）
+REASON_DIFFERENCE_NOT_FINITE = "READING_DIFFERENCE_NOT_FINITE"
+REASON_EN_NOT_FINITE = "EN_SCORE_NOT_FINITE"
+REASON_UNCERTAINTY_NOT_FINITE = "CERTIFICATE_UNCERTAINTY_NOT_FINITE"
+
+
+class CompatibilityNumericalError(Exception):
+    """En 计算超出有限浮点可表示范围（路由层映射为 HTTP 422）。
+
+    典型触发：两读数之差绝对值溢出为 inf（如 ±1.7e308 相减）、
+    En 数本身超过最大有限浮点（读数差有限但相对不确定度过大）、
+    或起点证书登记了非有限不确定度（inf/NaN，无法参与除法）。
+    携带机器可读原因码与结构化证据（仪器对、读数与不确定度）。
+    """
+
+    def __init__(
+        self,
+        reason_code: str,
+        message: str,
+        detail: Optional[dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.message = message
+        self.detail = detail or {}
+
 
 def _en_score(
     xi: float, xj: float, ui: float, uj: float
-) -> tuple[Optional[float], bool, str]:
-    """计算一对读数的 En 数与相容判定。
+) -> dict[str, Any]:
+    """计算一对读数的 En 数与相容判定（数值稳定版，pairs/groups 共用）。
 
-    En = |x_i - x_j| / sqrt(U_i^2 + U_j^2)，En <= 1 判为相容；
-    两个不确定度均为 0 时分母为 0、En 无定义（返回 None），
-    此时仅当两读数相等才相容。
+    En = |x_i - x_j| / sqrt(U_i^2 + U_j^2)，En <= 1 判为相容。
+    直接对不确定度平方求和会在极端量级出错：
+
+    * **大数溢出**：U≈1e308 时 U² 溢出为 inf、分母变为 inf，
+      差异巨大的一对（如 x_i=1e308、x_j=0）被误算成 En=0 而相容；
+    * **次正规下溢**：U 为非零次正规值（如 5e-324）时 U² 下溢为 0，
+      分母误判为“双零”而走读数相等规则——仅一方非零次正规时
+      相等读数被误判不相容，污染极大相容分组。
+
+    以 ``scale = max(U_i, U_j)`` 对分子分母**同尺度缩放**后用
+    ``math.hypot`` 求范数：``En = (|Δx|/scale) / hypot(U_i/scale,
+    U_j/scale)``，缩放后平方项恒 <=1，既不溢出也不把非零次正规
+    下溢成 0。仅当两个不确定度**恰好都为 0** 时 En 无定义
+    （返回 ``en=None``），此时仅当两读数相等才相容。
+
+    读数差绝对值或 En 超出有限浮点可表示范围时抛出
+    :class:`CompatibilityNumericalError`（路由层 422），
+    绝不让 inf/NaN 进入响应。
     """
     difference = abs(xi - xj)
-    denominator = math.sqrt(ui * ui + uj * uj)
-    if denominator == 0:
-        return None, difference == 0, EN_RULE_ZERO_UNCERTAINTY
-    en = difference / denominator
-    return en, en <= 1.0, EN_RULE_RATIO
+    if not math.isfinite(difference):
+        raise CompatibilityNumericalError(
+            REASON_DIFFERENCE_NOT_FINITE,
+            f"两读数之差绝对值 {difference!r} 超出有限浮点可表示范围，"
+            "无法计算 En 数（请检查读数量级，差值不得溢出为无穷）",
+        )
+
+    if ui == 0.0 and uj == 0.0:
+        return {
+            "difference": difference,
+            "en": None,
+            "compatible": difference == 0.0,
+            "rule": EN_RULE_ZERO_UNCERTAINTY,
+        }
+
+    scale = max(ui, uj)
+    norm = math.hypot(ui / scale, uj / scale)  # 1 <= norm <= sqrt(2)，恒有限非零
+    en = (difference / scale) / norm
+    if not math.isfinite(en):
+        raise CompatibilityNumericalError(
+            REASON_EN_NOT_FINITE,
+            f"En 数 {en!r} 超出有限浮点可表示范围：读数差 "
+            f"{difference!r} 相对扩展不确定度（{ui!r}, {uj!r}）过大，"
+            "无法以有限浮点给出 En（亦无法保证 En<=1 判定稳定）",
+            detail={
+                "difference": difference,
+                "uncertainty_a": ui,
+                "uncertainty_b": uj,
+            },
+        )
+    return {
+        "difference": difference,
+        "en": en,
+        "compatible": en <= 1.0,
+        "rule": EN_RULE_RATIO,
+    }
 
 
 def maximal_compatible_groups(
@@ -1270,6 +1343,17 @@ def build_measurement_compatibility_report(
     起点证书单位与目标单位不符的读数逐条给出原因、不参与计算。
     对可参与读数两两计算 En 并判定相容性，再以极大团（而非连通分量）
     给出全部人数 ≥ 2 的极大两两相容分组（可重叠，按仪器编码稳定排序）。
+
+    En 计算采用**以最大不确定度为尺度的稳定缩放**（见 :func:`_en_score`）：
+    不确定度先平方求和在 U≈1e308 时会溢出为 inf、把差异巨大的一对误判
+    相容；非零次正规 U 平方又会下溢为 0、误入“双零按读数相等”规则并
+    污染极大分组；缩放后用 ``math.hypot`` 求范数可同时规避二者。
+    ``pairs`` 与 ``groups`` 共用同一份两两判定（groups 直接由 pairs 的
+    ``compatible`` 派生），绝不分叉；两个不确定度确实都为零时 En 无
+    定义，仍仅按读数是否相等处理。读数差绝对值或 En 超出有限浮点可
+    表示范围（或起点证书不确定度非有限）时抛出
+    :class:`CompatibilityNumericalError`（路由层 422），不让 inf 进入
+    响应。
     """
     at_naive = to_utc_naive(at) if at else datetime.utcnow()
     at_s = fmt(at_naive)
@@ -1356,17 +1440,36 @@ def build_measurement_compatibility_report(
                     result["start_certificate_id"] = start_node["certificate_id"]
                     result["certificate_unit"] = cert_unit
                 else:
+                    cert_uncertainty = start_node["uncertainty"]
+                    if not math.isfinite(cert_uncertainty):
+                        # 请求值经 FiniteFloat 校验必为有限值，但不确定度
+                        # 取自库内起点证书（写入侧允许 ge=0 的 float）；
+                        # inf/NaN 无法参与 En 除法，也不能进入响应
+                        raise CompatibilityNumericalError(
+                            REASON_UNCERTAINTY_NOT_FINITE,
+                            f"仪器 {code} 的起点证书 "
+                            f"{start_node['certificate_id']} 扩展不确定度 "
+                            f"{cert_uncertainty!r} 不是有限浮点，"
+                            "无法参与 En 计算",
+                            detail={
+                                "instrument": code,
+                                "start_certificate_id": (
+                                    start_node["certificate_id"]
+                                ),
+                                "uncertainty": None,
+                            },
+                        )
                     participants.append(code)
                     accepted[code] = {
                         "value": value,
-                        "uncertainty": start_node["uncertainty"],
+                        "uncertainty": cert_uncertainty,
                     }
                     result.update(
                         {
                             "participated": True,
                             "start_certificate_id": start_node["certificate_id"],
                             "certificate_unit": cert_unit,
-                            "uncertainty": start_node["uncertainty"],
+                            "uncertainty": cert_uncertainty,
                         }
                     )
 
@@ -1376,29 +1479,45 @@ def build_measurement_compatibility_report(
             nonparticipants.append(np_detail)
         reading_results.append(result)
 
-    # 两两 En 计算（按仪器编码排序，保证输出稳定）
+    # 两两 En 计算（按仪器编码排序，保证输出稳定）。
+    # pairs 的 compatible 判定是唯一真相来源：groups 直接复用
+    # 同一份 pair 结果派生相容对，确保两者判定绝不分叉。
     pairs: list[dict[str, Any]] = []
     compatible_pairs: list[tuple[str, str]] = []
     for a, b in combinations(sorted(participants), 2):
         da, db = accepted[a], accepted[b]
-        en, compatible, rule = _en_score(
-            da["value"], db["value"], da["uncertainty"], db["uncertainty"]
-        )
-        pairs.append(
-            {
-                "instrument_a": a,
-                "instrument_b": b,
-                "value_a": da["value"],
-                "value_b": db["value"],
-                "uncertainty_a": da["uncertainty"],
-                "uncertainty_b": db["uncertainty"],
-                "difference": abs(da["value"] - db["value"]),
-                "en": en,
-                "compatible": compatible,
-                "rule": rule,
-            }
-        )
-        if compatible:
+        try:
+            score = _en_score(
+                da["value"], db["value"],
+                da["uncertainty"], db["uncertainty"],
+            )
+        except CompatibilityNumericalError as exc:
+            # 补充仪器对证据后由路由层统一映射为 422
+            exc.detail.update(
+                {
+                    "instrument_a": a,
+                    "instrument_b": b,
+                    "value_a": da["value"],
+                    "value_b": db["value"],
+                    "uncertainty_a": da["uncertainty"],
+                    "uncertainty_b": db["uncertainty"],
+                }
+            )
+            raise
+        pair = {
+            "instrument_a": a,
+            "instrument_b": b,
+            "value_a": da["value"],
+            "value_b": db["value"],
+            "uncertainty_a": da["uncertainty"],
+            "uncertainty_b": db["uncertainty"],
+            "difference": score["difference"],
+            "en": score["en"],
+            "compatible": score["compatible"],
+            "rule": score["rule"],
+        }
+        pairs.append(pair)
+        if pair["compatible"]:
             compatible_pairs.append((a, b))
 
     groups = [

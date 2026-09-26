@@ -4,7 +4,13 @@ import math
 import pytest
 from fastapi.testclient import TestClient
 
-from app.engine import maximal_compatible_groups
+from app.engine import (
+    EN_RULE_RATIO,
+    EN_RULE_ZERO_UNCERTAINTY,
+    CompatibilityNumericalError,
+    _en_score,
+    maximal_compatible_groups,
+)
 
 AT = "2026-06-15T00:00:00Z"
 URL = "/api/assessments/measurement-compatibility"
@@ -426,6 +432,181 @@ def test_measurement_compatibility_does_not_write_business_data(
     assert r.status_code == 200
     assert r.json()["dry_run"] is True
     assert counts() == before
+
+
+def test_en_score_stable_against_square_overflow():
+    """大不确定度平方溢出为 inf 的场景：旧式分母 inf -> En=0 把差异巨大
+    的一对误判相容；稳定缩放后 En≈0.707 仍相容但有限，差异更大时必须
+    判不相容（绝不能让溢出翻转判定）。"""
+    huge = 1.5e308
+    s = _en_score(huge, 0.0, huge, huge)
+    assert math.isfinite(s["en"])
+    assert s["en"] == pytest.approx(1.0 / math.sqrt(2.0))
+    assert s["compatible"] is True
+    assert s["rule"] == EN_RULE_RATIO
+
+    # 两个 U 都大到平方溢出但合并范数仍有限：差值超过真实合并 U
+    # （En>1）而差值本身有限——旧式分母 inf、en=0 误判相容
+    s = _en_score(1e308, -5e307, 1e308, 1e308)
+    assert math.isfinite(s["en"])
+    assert s["en"] == pytest.approx(1.5 / math.sqrt(2.0))
+    assert s["en"] > 1.0
+    assert s["compatible"] is False
+
+    # 仅一方 U 极大：旧式 en=0 误判，新式差值/U 正确判不相容
+    s = _en_score(huge, -1e307, huge, 0.0)
+    assert math.isfinite(s["en"])
+    assert s["en"] == pytest.approx(1.6 / 1.5)
+    assert s["compatible"] is False
+
+
+def test_en_score_stable_against_subnormal_underflow():
+    """非零次正规 U 平方下溢为 0：旧式误入双零规则（按读数相等判定），
+    稳定缩放后 hypot 仍识别非零分母，按真实 En 判定。"""
+    tiny = 5e-324  # 最小正次正规值，其平方下溢为 0
+    assert tiny * tiny == 0.0
+
+    # 相等读数：旧式双零规则相容；新式 En=0 同样相容（结论一致、走常式）
+    s = _en_score(1.0, 1.0, tiny, tiny)
+    assert s["en"] == pytest.approx(0.0)
+    assert s["compatible"] is True
+    assert s["rule"] == EN_RULE_RATIO
+
+    # 相差一个次正规单位：旧式误判不相容（双零 + 不相等），
+    # 真实 En=1/sqrt2 <=1，应判相容
+    s = _en_score(tiny, 0.0, tiny, tiny)
+    assert math.isfinite(s["en"])
+    assert s["en"] == pytest.approx(1.0 / math.sqrt(2.0))
+    assert s["compatible"] is True
+    assert s["rule"] == EN_RULE_RATIO
+
+    # 一方为 0、另一方为次正规：旧式分母 0 误走相等规则
+    s = _en_score(tiny, 0.0, 0.0, tiny)
+    assert s["en"] == pytest.approx(1.0)
+    assert s["compatible"] is True
+
+    # 两个 U 确实都为 0 时仍走读数相等规则
+    s = _en_score(3.0, 3.0, 0.0, 0.0)
+    assert s["en"] is None
+    assert s["compatible"] is True
+    assert s["rule"] == EN_RULE_ZERO_UNCERTAINTY
+    s = _en_score(3.0, 4.0, 0.0, 0.0)
+    assert s["en"] is None
+    assert s["compatible"] is False
+    assert s["rule"] == EN_RULE_ZERO_UNCERTAINTY
+
+
+def test_en_score_raises_on_non_representable_results():
+    """读数差溢出或 En 超过最大有限浮点：抛数值错误（路由层映射 422），
+    不返回 inf。"""
+    with pytest.raises(CompatibilityNumericalError) as ei:
+        _en_score(1.7e308, -1.7e308, 1.0, 1.0)
+    assert ei.value.reason_code == "READING_DIFFERENCE_NOT_FINITE"
+
+    # 差值有限但相对 U 过大：En 超过最大有限浮点
+    with pytest.raises(CompatibilityNumericalError) as ei:
+        _en_score(1e308, 0.0, 0.5, 0.5)
+    assert ei.value.reason_code == "EN_SCORE_NOT_FINITE"
+
+    # 恰可表示的极大 En（En<=1）不报错
+    s = _en_score(1e308, 0.0, 1e308, 1e308)
+    assert math.isfinite(s["en"]) and s["compatible"] is True
+
+
+def test_huge_uncertainties_overflow_no_false_compatibility_group(
+    client: TestClient,
+):
+    """端到端：U≈1.5e308 平方溢出的旧 bug 会把不相容对并入极大分组；
+    修复后 pairs 与 groups 共用稳定判定，不相容仪器不得成组。"""
+    _submit(
+        client,
+        [_inst("GH", root=True), _inst("H1"), _inst("H2"), _inst("H3")],
+        [
+            _cert("CGH", "GH", issued="2024-01-01T00:00:00",
+                  vf="2024-01-01T00:00:00", vu="2030-01-01T00:00:00",
+                  u=0.0, unit="mm"),
+            _cert("CH1", "H1", u=1e308, unit="mm"),
+            _cert("CH2", "H2", u=1e308, unit="mm"),
+            _cert("CH3", "H3", u=1e308, unit="mm"),
+        ],
+        [
+            {"child_cert_id": "CH1", "parent_cert_id": "CGH"},
+            {"child_cert_id": "CH2", "parent_cert_id": "CGH"},
+            {"child_cert_id": "CH3", "parent_cert_id": "CGH"},
+        ],
+    )
+    r = _post(client, [
+        _reading("H1", 1e308),      # H1/H2 差 1.5e308，En≈1.06>1 -> 不相容
+        _reading("H2", -5e307),     # （差值本身有限，但旧平方求和溢出）
+        _reading("H3", 0.0),        # H1-H3、H3-H2 均 En<=1 相容
+    ])
+    assert r.status_code == 200, r.text
+    d = r.json()
+    verdict = {
+        (p["instrument_a"], p["instrument_b"]): p for p in d["pairs"]
+    }
+    assert math.isfinite(verdict[("H1", "H2")]["en"])
+    assert verdict[("H1", "H2")]["compatible"] is False
+    assert verdict[("H1", "H3")]["compatible"] is True
+    assert verdict[("H2", "H3")]["compatible"] is True
+    # 旧 bug 下三者会被错误并成 {H1,H2,H3}；修复后仅两个二人团
+    assert d["groups"] == [
+        {"members": ["H1", "H3"], "size": 2},
+        {"members": ["H2", "H3"], "size": 2},
+    ]
+
+
+def test_subnormal_uncertainties_end_to_end(client: TestClient):
+    """端到端：非零次正规 U 不再误入双零规则污染极大相容分组。"""
+    tiny = 5e-324
+    _submit(
+        client,
+        [_inst("GT", root=True), _inst("T1"), _inst("T2")],
+        [
+            _cert("CGT", "GT", issued="2024-01-01T00:00:00",
+                  vf="2024-01-01T00:00:00", vu="2030-01-01T00:00:00",
+                  u=0.0, unit="mm"),
+            _cert("CT1", "T1", u=tiny, unit="mm"),
+            _cert("CT2", "T2", u=tiny, unit="mm"),
+        ],
+        [
+            {"child_cert_id": "CT1", "parent_cert_id": "CGT"},
+            {"child_cert_id": "CT2", "parent_cert_id": "CGT"},
+        ],
+    )
+    # 两读数相差一个次正规单位：真实 En=1/sqrt2<=1，应相容
+    r = _post(client, [_reading("T1", tiny), _reading("T2", 0.0)])
+    assert r.status_code == 200, r.text
+    d = r.json()
+    p = d["pairs"][0]
+    assert p["rule"] == "en_le_1"
+    assert p["en"] == pytest.approx(1.0 / math.sqrt(2.0))
+    assert p["compatible"] is True
+    assert d["groups"] == [{"members": ["T1", "T2"], "size": 2}]
+
+
+def test_difference_overflow_returns_422(client: TestClient):
+    """读数差绝对值溢出为无穷：422 并说明原因，响应不含 Infinity。"""
+    _mm_lab(client, codes=("W1", "W2"), u=1.0)
+    r = _post(client, [_reading("W1", 1.7e308), _reading("W2", -1.7e308)])
+    assert r.status_code == 422, r.text
+    body = r.json()["detail"]
+    assert body["code"] == "READING_DIFFERENCE_NOT_FINITE"
+    assert body["message"]
+    assert body["detail"]["instrument_a"] == "W1"
+    assert body["detail"]["instrument_b"] == "W2"
+    assert "Infinity" not in r.text and "NaN" not in r.text
+
+
+def test_en_overflow_returns_422(client: TestClient):
+    """读数差有限但 En 超出有限浮点范围：422 说明原因，响应不含 Infinity。"""
+    _mm_lab(client, codes=("W1", "W2"), u=0.5)
+    r = _post(client, [_reading("W1", 1e308), _reading("W2", 0.0)])
+    assert r.status_code == 422, r.text
+    body = r.json()["detail"]
+    assert body["code"] == "EN_SCORE_NOT_FINITE"
+    assert body["detail"]["instrument_a"] == "W1"
+    assert "Infinity" not in r.text and "NaN" not in r.text
 
 
 def test_maximal_compatible_groups_unit():

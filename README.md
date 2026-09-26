@@ -76,7 +76,7 @@ curl -s -X POST http://localhost:8000/api/submissions/preflight \
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（211 个用例）
+pytest -q        # 运行测试（218 个用例）
 ```
 
 本地服务监听 **http://localhost:8000**（与 Docker Compose 映射端口一致）：
@@ -1219,9 +1219,25 @@ curl -X POST http://localhost:8000/api/assessments/common-traceability \
 En = |x_i - x_j| / sqrt(U_i^2 + U_j^2)     En ≤ 1  判为相容
 ```
 
-两个不确定度均为 0 时分母为 0、En 无定义（响应中 `en=null`，
-`rule=zero_uncertainty_equality`），此时**仅当两读数相等才相容**；
-仅一方为 0 时仍按常式计算。
+En 计算以**两个不确定度中的较大者为尺度做稳定缩放**（缩放后用
+`hypot` 求范数），避免直接平方求和在极端量级下出错：
+
+- 不确定度约 1e308 时 `U²` 溢出为无穷、分母变为无穷，差异巨大的一对
+  会被误算成 En=0 而**误判相容**；
+- 不确定度为非零**次正规**值（如 5e-324）时 `U²` 下溢为 0，分母误判
+  为“双零”而错走读数相等规则，进而**污染极大相容分组**。
+
+`pairs` 的相容判定是唯一真相来源，`groups` 直接复用同一判定派生
+（两者绝不分叉）。两个不确定度**确实均为 0** 时分母为 0、En 无定义
+（响应中 `en=null`，`rule=zero_uncertainty_equality`），此时**仅当
+两读数相等才相容**；仅一方为 0 时仍按常式计算。
+
+若**读数差绝对值**（如 ±1.7e308 相减）或 **En 本身**（差值有限但相对
+不确定度过大）超出有限浮点可表示范围，接口返回 **422** 并在
+`detail` 中给出原因码（`READING_DIFFERENCE_NOT_FINITE` /
+`EN_SCORE_NOT_FINITE`）、中文说明与仪器对证据，**不让 ±Infinity/NaN
+进入响应**；起点证书登记了非有限不确定度时同理以
+`CERTIFICATE_UNCERTAINTY_NOT_FINITE` 返回 422。
 
 分组取**全部人数 ≥ 2 的极大两两相容分组**（相容关系图的**极大团**）：
 分组可重叠（同一仪器可属于多个分组），组内成员与分组列表均按仪器编码
@@ -1318,7 +1334,9 @@ curl -X POST http://localhost:8000/api/assessments/measurement-compatibility \
 
 请求校验：读数少于 2 条或多于 12 条、仪器编码重复/为空白、测量值为
 NaN/±Inf（非有限浮点）、缺 `target_unit`/`readings` 字段时返回 **422**
-（中文原因）；时间入参按 UTC 解释，建议统一用 `...Z` 格式，`at` 留空取
+（中文原因）；读数量级合法但两两**读数差绝对值或 En 超出有限浮点可
+表示范围**时同样返回 **422**（附原因码与仪器对，不把无穷值放入响应）；
+时间入参按 UTC 解释，建议统一用 `...Z` 格式，`at` 留空取
 服务端当前时间。
 
 ### 8）证书修订历史（GET /api/certificates/{id}/revisions · /revisions/diff）
@@ -1669,10 +1687,14 @@ curl -G "http://localhost:8000/api/calibration-bookings/inspection" \
 11. 测量相容性评估：对每条读数复用步骤 1~5（只读），仅以“唯一成链且
     零 ERROR”的链参与，取起点证书扩展不确定度为 U；链不可用或起点证书
     单位与目标单位不符的读数逐条记录原因、不参与。对可参与读数两两计算
-    `En=|x_i-x_j|/sqrt(U_i^2+U_j^2)`，En≤1 判为相容（两 U 均为 0 时
-    En 无定义，仅读数相等才相容）；再以 Bron–Kerbosch（带枢轴）枚举
-    相容关系图的全部极大团，输出人数 ≥2 的极大两两相容分组（可重叠，
-    按仪器编码稳定排序，不以连通分量代替）。全程不写入业务数据。
+    `En=|x_i-x_j|/sqrt(U_i^2+U_j^2)`，En≤1 判为相容；En 以最大 U 为尺度
+    稳定缩放（避免平方求和在 1e308 量级溢出为无穷而误判相容、非零次正规
+    U 平方下溢为 0 而误入双零规则污染分组），pairs 与 groups 共用同一份
+    判定；两 U 确实均为 0 时 En 无定义，仅读数相等才相容。读数差绝对值
+    或 En 超出有限浮点范围时返回 422，不让无穷值进入响应。再以
+    Bron–Kerbosch（带枢轴）枚举相容关系图的全部极大团，输出人数 ≥2 的
+    极大两两相容分组（可重叠，按仪器编码稳定排序，不以连通分量代替）。
+    全程不写入业务数据。
 12. 证书修订历史：单条证书接口与批量提交按 ID upsert 证书时，在同一事务
     内维护 `certificate_revisions` 连续版本快照——首次写入记 v1；功能
     上线前已存在的存量证书首次更新前先补录旧值为 v1；仅业务字段实际变化
@@ -1740,7 +1762,7 @@ tests/test_coverage.py       16 个仪器时间窗覆盖查询测试（含 6 个
                              跨截止点窗口分段、交接秒内窗口、时区偏移
                              换算保留微秒、反向小数窗口 422）
 tests/test_common_trace.py   12 个批次共同溯源核查测试
-tests/test_measurement_compatibility.py  14 个测量相容性评估测试
+tests/test_measurement_compatibility.py  21 个测量相容性评估测试
 tests/test_calibration.py    28 个校准工位预约测试
 tests/test_inspection.py     15 个已确认预约有效性巡检测试（半开窗筛选、
                              422 入参、valid/changed/invalid 三态原因码、

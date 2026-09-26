@@ -810,7 +810,9 @@ class CompatibilityPair(BaseModel):
     en: Optional[float] = Field(
         None,
         description=(
-            "En=|x_a-x_b|/sqrt(U_a^2+U_b^2)；两个不确定度均为 0 时无定义（null）"
+            "En=|x_a-x_b|/sqrt(U_a^2+U_b^2)（以最大 U 稳定缩放计算，"
+            "避免平方求和溢出/次正规下溢）；两个不确定度均为 0 时无定义"
+            "（null）。读数差或 En 超出有限浮点范围时整体返回 422"
         ),
     )
     compatible: bool = Field(

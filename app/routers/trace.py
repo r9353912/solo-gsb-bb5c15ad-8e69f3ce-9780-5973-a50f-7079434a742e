@@ -7,6 +7,7 @@ from sqlite3 import Connection
 from .. import crud
 from ..database import get_db
 from ..engine import (
+    CompatibilityNumericalError,
     assess_deactivation,
     build_common_trace_report,
     build_measurement_compatibility_report,
@@ -160,13 +161,26 @@ def measurement_compatibility(
     单位与目标单位不符的读数逐条返回原因、不参与计算。
 
     对可参与读数两两计算 En=|x_i-x_j|/sqrt(U_i²+U_j²)，En≤1 判为相容；
-    两个不确定度均为 0 时 En 无定义（响应中为 null），仅读数相等才相容。
+    计算以稳定缩放完成（大数不溢出、次正规非零值不下溢，pairs 与
+    极大相容分组共用同一份判定）。两个不确定度均为 0 时 En 无定义
+    （响应中为 null），仅读数相等才相容。读数差绝对值或 En 超出有限
+    浮点可表示范围时返回 422（说明原因，不把无穷值放入响应）。
     返回每对 En 与判定，以及全部人数 ≥2 的**极大两两相容分组**（极大团，
     分组可重叠，按仪器编码稳定排序，不以连通分量代替）。
     """
-    return build_measurement_compatibility_report(
-        db,
-        body.at,
-        body.target_unit,
-        [(r.instrument_code, r.value) for r in body.readings],
-    )
+    try:
+        return build_measurement_compatibility_report(
+            db,
+            body.at,
+            body.target_unit,
+            [(r.instrument_code, r.value) for r in body.readings],
+        )
+    except CompatibilityNumericalError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": exc.reason_code,
+                "message": exc.message,
+                "detail": exc.detail,
+            },
+        )
